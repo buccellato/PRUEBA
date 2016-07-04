@@ -1,0 +1,301 @@
+#include "libreriaUMC.h"
+
+void ejecutarComandos() {
+	char buffer[1000];
+
+	while (1) {
+		printf("Ingrese comando:\n");
+		scanf("%s", buffer);
+
+		if (!strcmp(buffer, "retardo")) {
+			int retardoNuevo;
+			printf("\nIngrese nuevo valor de retardo:\n");
+			scanf("%d", &retardoNuevo);
+
+			pthread_mutex_lock(&mutexRetardo);
+			retardo = retardoNuevo;
+			pthread_mutex_unlock(&mutexRetardo);
+
+		} else if (!strcmp(buffer, "dump")) {
+			int pid;
+			printf(
+					"Ingrese 0 si quiere un reporte de todos los procesos o ingrese el pid del proceso para un reporte particular\n");
+			scanf("%d", &pid);
+
+			pthread_mutex_lock(&mutexListaProcesos);
+			pthread_mutex_lock(&mutexListaFrames);
+
+			if (pid == 0) {
+				//Hacer log de todos los procesos
+				dumpTodosLosProcesos();
+
+			} else {
+				//Hacer log del proceso en particular
+				dumpProcesoParticular(pid);
+			}
+
+			pthread_mutex_unlock(&mutexListaFrames);
+			pthread_mutex_unlock(&mutexListaProcesos);
+
+		} else if (!strcmp(buffer, "flush")) {
+			printf("Escriba tlb o memory\n");
+			scanf("%s", buffer);
+
+			if (!strcmp(buffer, "tlb")) {
+				vaciarTLB();
+			} else if (!strcmp(buffer, "memory")) {
+				flushMemoria();
+			} else {
+				printf("Comando Incorrecto\n");
+			}
+
+		} else {
+			printf("Comando Incorrecto\n\n");
+		}
+
+	}
+}
+
+void mostrarArchivoConfig() {
+	log_info(logUMC,"El puerto de la UMC es: %d", puertoUMC);
+	log_info(logUMC,"El puerto de las CPU's es: %d", puertoCPUs);
+	log_info(logUMC,"El puerto del SWAP es: %d", puertoSWAP);
+	log_info(logUMC,"El IP del SWAP es: %s", ipSWAP);
+	log_info(logUMC,"La cantidad de marcos es: %d", cantMarcos);
+	log_info(logUMC,"El tamanio de las Marcos es: %d", tamanioDeMarcos);
+	log_info(logUMC,"La cantidad de marcos por Proceso son: %d",
+			cantidadDeMarcosPorProceso);
+	log_info(logUMC,"La cantidad de entradas de una TLB es: %d", cantidadEntradasTLB);
+	log_info(logUMC,"El Retardo es de: %d", retardo);
+	log_info(logUMC,"Algoritmo de reemplazo de paginas: %s\n", algoritmo);
+}
+
+int main(int argc, char* argv[]) {
+
+	//-------Vacio logUMC
+	FILE*logger = fopen("LogUMC.txt", "w");
+	fclose(logger);
+
+	//-------Inicializo el logUMC
+	logUMC = log_create("LogUMC.txt", "UMC", 1, LOG_LEVEL_INFO);
+
+	//----------Archivo de configuracion
+
+	if (argc == 1) {
+		log_info(logUMC,"Debe ingresar la ruta del archivo en LC");
+		return -1;
+	}
+
+	if (argc != 2) {
+		log_info(logUMC,"Numero incorrecto de argumentos");
+		return -2;
+	}
+
+	//Cargo archivo de configuracion
+	t_config* configuracion = config_create(argv[1]);
+	puertoUMC = config_get_int_value(configuracion, "PUERTO_UMC");
+	puertoCPUs = config_get_int_value(configuracion, "PUERTO_CPU");
+	puertoSWAP = config_get_int_value(configuracion, "PUERTO_SWAP");
+	ipSWAP = config_get_string_value(configuracion, "IP_SWAP");
+	cantMarcos = config_get_int_value(configuracion, "MARCOS");
+	tamanioDeMarcos = config_get_int_value(configuracion, "MARCO_SIZE");
+	cantidadDeMarcosPorProceso = config_get_int_value(configuracion,
+			"MARCOS_POR_PROCESO");
+	cantidadEntradasTLB = config_get_int_value(configuracion, "ENTRADAS_TLB");
+	retardo = config_get_int_value(configuracion, "RETARDO");
+	algoritmo = config_get_string_value(configuracion, "ALGORITMO");
+
+	//Muestro archivo de configuracion
+	mostrarArchivoConfig();
+
+	//Seteo la cantidad de accesos a memoria en 0
+
+	cantAccesosMemoria = 0;
+
+	//Inicializo semaforos compartidos
+	pthread_mutex_init(&mutexListaFrames, NULL);
+	pthread_mutex_init(&mutexListaProcesos, NULL);
+	pthread_mutex_init(&mutexTLB, NULL);
+	pthread_mutex_init(&mutexCantAccesosMemoria, NULL);
+	pthread_mutex_init(&mutexRetardo, NULL);
+	pthread_mutex_init(&mutexMemoriaReal, NULL);
+
+	//-------------------------------CONEXION AL SWAP-------------------------------------
+
+	log_info(logUMC,"Me conecto al Swap");
+
+	socket_swap = conectarAServidor(ipSWAP, puertoSWAP);
+
+	char* bufferSwap = malloc(200);
+
+	int bytesRecibidos = recv(socket_swap, bufferSwap, 50, 0);
+	if (bytesRecibidos <= 0) {
+		log_error(logUMC,"El SWAP se ha desconectado");
+	}
+
+	bufferSwap[bytesRecibidos] = '\0';
+
+	log_info(logUMC,"Recibi %d bytes con el siguiente mensaje: %s", bytesRecibidos,
+			bufferSwap);
+
+	send(socket_swap, "Hola soy la UMC", 16, 0);
+
+	bytesRecibidos = recv(socket_swap, bufferSwap, 50, 0);
+
+	if (bytesRecibidos <= 0) {
+		log_error(logUMC,"El SWAP se ha desconectado");
+	}
+
+	bufferSwap[bytesRecibidos] = '\0';
+
+	log_info(logUMC,"Respuesta: %s\n", bufferSwap);
+
+	if (strcmp("Conexion aceptada", bufferSwap) == 0) {
+		enviarTamanioDeMarcos(socket_swap);
+	}
+
+
+	//-------------------------------CONEXION AL NUCLEO-------------------------------------
+	//Creo un hilo para comunicarme con el nucleo
+	pthread_t hilo_conexionNUCLEO;
+	//Atributo Detached
+	pthread_attr_t atributo1;
+	pthread_attr_init(&atributo1);
+	pthread_attr_setdetachstate(&atributo1, PTHREAD_CREATE_DETACHED);
+	int socketUMCParaNucleo = crearSocketDeEscucha(puertoUMC);
+	int falloPNucleo_thread;
+		char* bufferEscuchaNucleo = malloc(200);
+		while (1) {
+			int socket_cpu = aceptarCliente(socketUMCParaNucleo);
+			if ((socket_cpu) == -1) {
+				log_error(logUMC,"Error en el accept()");
+				abort();
+			}
+			send(socket_cpu, "Hola quien sos?", 16, 0);
+
+			int bytesRecibidos = recv(socket_cpu, bufferEscuchaNucleo, 50, 0);
+
+			if (bytesRecibidos <= 0) {
+				log_error(logUMC,"El cliente se ha desconectado");
+				abort();
+			}
+			bufferEscuchaNucleo[bytesRecibidos] = '\0';
+			if (strcmp("Hola soy el NUCLEO", bufferEscuchaNucleo) == 0)
+			{
+				falloPNucleo_thread = pthread_create(&hilo_conexionNUCLEO, &atributo1,
+						(void*) escucharNUCLEO, (void*) socket_cpu);
+				if (falloPNucleo_thread < 0)
+				{
+					log_error(logUMC,"Error Hilo Esucha Nucleo");
+					abort();
+				}
+			}
+
+
+		}
+
+
+
+//-----------------------MANEJO DE FRAMES Y PAGINAS---------------------------------
+
+//reservo memoria para la memoria real
+	memoria_real = reservarMemoria(cantMarcos, tamanioDeMarcos);
+
+//Creo lista de frames inicializada
+
+	inicializarListaDeFrames();
+
+	//la lista se creo pero si la TLB no esta habilitada queda vacia
+	TLB = NULL;
+
+	//CREO UNA LISTA PARA REFERENCIAR LOS PROCESOS
+	listaProcesos = crearListaDeProcesos();
+
+	//VERIFICO SI LA TLB ESTA HABILITADA
+	if (cantidadEntradasTLB != 0) {
+		TLB = crearTLB();
+		log_info(logUMC,"La TLB esta Habilitada\n");
+	}
+
+	//-----------------------------------------------------------------------------------------------------------------
+
+	//Creo un hilo para comunicarme con el nucleo
+	//pthread_t hilo_conexionNUCLEO;
+
+	//Atributo Detached
+	pthread_attr_t atributo;
+	pthread_attr_init(&atributo);
+	pthread_attr_setdetachstate(&atributo, PTHREAD_CREATE_DETACHED);
+
+	//Creo hilo de la consola
+	pthread_t hiloConsola;
+
+	pthread_create(&hiloConsola, &atributo, (void *) ejecutarComandos,
+	NULL);
+
+	//-------------CREAR UN SOCKET DE ESCUCHA PARA LAS CPU's Y EL NUCLEO-------------------------
+	int socketUMCParaCPU = crearSocketDeEscucha(puertoUMC);
+	char* bufferEscucha = malloc(200);
+
+	int falloP_thread;
+
+	//CADA VEZ QUE ESCUCHA UNA NUEVA CONEXION CREA UN HILO, PREGUNTA SI ES UNA CPU O EL NUCLEO
+	//SEGUN QUIEN SEA EJECUTA LA FUNCION CORRESPONDIENTE:
+	// - escucharCPU(int socket_cliente);
+	// - escucharNUCLEO(int socket_cliente);
+
+	while (1) {
+		int socket_cpu = aceptarCliente(socketUMCParaCPU);
+		if ((socket_cpu) == -1) {
+			log_error(logUMC,"Error en el accept()");
+			abort();
+		}
+		send(socket_cpu, "Hola quien sos?", 16, 0);
+
+		int bytesRecibidos = recv(socket_cpu, bufferEscucha, 50, 0);
+
+		if (bytesRecibidos <= 0) {
+			log_error(logUMC,"El cliente se ha desconectado");
+			abort();
+		}
+		bufferEscucha[bytesRecibidos] = '\0';
+		if (strcmp("Hola soy la CPU", bufferEscucha) == 0) {
+			pthread_t* hiloCPU = malloc(sizeof(pthread_t));
+			falloP_thread = pthread_create(hiloCPU, &atributo,
+					(void*) escucharCPU, (void*) socket_cpu);
+			if (falloP_thread < 0) {
+				log_error(logUMC,"Error Hilo CPU");
+				abort();
+			}
+
+		}
+		/*
+		else if (strcmp("Hola soy el NUCLEO", bufferEscucha) == 0)
+		{
+			falloP_thread = pthread_create(&hilo_conexionNUCLEO, &atributo,
+					(void*) escucharNUCLEO, (void*) socket_cpu);
+			if (falloP_thread < 0)
+			{
+				log_error(logUMC,"Error Hilo Esucha Nucleo");
+				abort();
+			}
+		}
+		*/
+
+	}
+
+	//Liberar memoria
+
+	log_info(logUMC,"Liberando Memoria");
+
+	free(memoria_real);
+
+	free(bufferSwap);
+
+	log_info(logUMC,"Memoria Liberada\n");
+
+	pthread_attr_destroy(&atributo);
+
+	return 0;
+
+}
